@@ -125,31 +125,46 @@ function adminFetch(endpoint,options){
 
 document.addEventListener('DOMContentLoaded',function(){
   document.querySelectorAll('.side-item[data-t]').forEach(function(el){el.onclick=function(){document.querySelectorAll('.side-item[data-t]').forEach(function(x){x.classList.remove('active');});el.classList.add('active');document.querySelectorAll('.panel').forEach(function(p){p.classList.remove('on');});$('t-'+el.dataset.t).classList.add('on');};});
-  // Admin 인증 체크
   if(!getAdminSecret()){showAdminLogin();}else{initAdmin();}
 });
 
+function hideChrome(){
+  var h=document.querySelector('.header');if(h)h.style.display='none';
+  var s=document.querySelector('.side');if(s)s.style.display='none';
+  var m=document.querySelector('.main');if(m){m.style.gridColumn='1/-1';m.style.display='flex';m.style.alignItems='center';m.style.justifyContent='center';m.style.minHeight='100vh';}
+  var layout=document.querySelector('.layout');if(layout)layout.style.gridTemplateColumns='1fr';
+}
+function showChrome(){
+  var h=document.querySelector('.header');if(h)h.style.display='';
+  var s=document.querySelector('.side');if(s)s.style.display='';
+  var m=document.querySelector('.main');if(m){m.style.gridColumn='';m.style.display='';m.style.alignItems='';m.style.justifyContent='';m.style.minHeight='';}
+  var layout=document.querySelector('.layout');if(layout)layout.style.gridTemplateColumns='';
+}
+
 function showAdminLogin(){
-  $('t-dash').innerHTML='<div style="max-width:400px;margin:60px auto;text-align:center">'+
+  hideChrome();
+  $('t-dash').classList.add('on');
+  $('t-dash').innerHTML='<div style="max-width:400px;width:100%;text-align:center;padding:40px 20px">'+
     '<div style="font-size:48px;margin-bottom:16px">🔐</div>'+
     '<h2 style="font-size:20px;font-weight:700;margin-bottom:8px">관리자 인증</h2>'+
     '<p style="font-size:13px;color:var(--t3);margin-bottom:24px">Admin Secret을 입력하세요</p>'+
     '<div class="field"><input class="inp" id="adminKey" type="password" placeholder="Admin Secret" style="text-align:center"></div>'+
     '<button class="btn btn-p" style="width:100%" onclick="verifyAdmin()">인증</button>'+
+    '<p style="margin-top:20px;font-size:11px;color:var(--t4)">체인저스캠퍼스 × anderson.asia</p>'+
   '</div>';
-  $('t-dash').classList.add('on');
+  setTimeout(function(){var k=$('adminKey');if(k)k.focus();},200);
 }
 
 function verifyAdmin(){
   var key=$('adminKey').value.trim();
   if(!key){toast('시크릿 키를 입력하세요','err');return;}
   setAdminSecret(key);
-  // 실제 API 호출로 검증
   adminFetch('/admin/stats').then(function(r){
     if(!r.ok)throw new Error('invalid');
     return r.json();
   }).then(function(){
     toast('관리자 인증 성공');
+    showChrome();
     initAdmin();
   }).catch(function(){
     setAdminSecret('');
