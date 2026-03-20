@@ -109,23 +109,40 @@ function cM(){$('mo').classList.remove('open');}
 function uc(){$('styC').textContent=D.sty.length;$('usrC').textContent=D.usr.length;}
 function gasUrl(){return '';}
 
-// ── Admin Secret 관리 ──
-function getAdminSecret(){return localStorage.getItem('yt_admin_secret')||'';}
-function setAdminSecret(s){localStorage.setItem('yt_admin_secret',s);}
+// ── Admin 세션 관리 ──
+function getAdminToken(){return localStorage.getItem('yt_admin_token')||'';}
+function setAdminToken(t){localStorage.setItem('yt_admin_token',t);}
+function getAdminUser(){try{return JSON.parse(localStorage.getItem('yt_admin_user')||'null');}catch(e){return null;}}
+function setAdminUser(u){localStorage.setItem('yt_admin_user',JSON.stringify(u));}
+function clearAdmin(){localStorage.removeItem('yt_admin_token');localStorage.removeItem('yt_admin_user');}
 
 function adminFetch(endpoint,options){
   options=options||{};options.headers=options.headers||{};
-  options.headers['X-Admin-Secret']=getAdminSecret();
+  var token=getAdminToken();
+  if(token)options.headers['Authorization']='Bearer '+token;
   options.headers['Content-Type']=options.headers['Content-Type']||'application/json';
   return fetch(PROXY_BASE+endpoint,options).then(function(r){
-    if(r.status===403){toast('관리자 인증 실패. 시크릿 키를 확인하세요.','err');throw new Error('ADMIN_UNAUTHORIZED');}
+    if(r.status===403){
+      return r.clone().json().then(function(d){
+        if(d.code==='NOT_ADMIN'){toast('관리자 권한이 없는 계정입니다.','err');}
+        else{toast('관리자 인증 실패.','err');}
+        throw new Error('ADMIN_UNAUTHORIZED');
+      });
+    }
+    if(r.status===401){clearAdmin();showAdminLogin();throw new Error('SESSION_EXPIRED');}
     return r;
   });
 }
 
 document.addEventListener('DOMContentLoaded',function(){
   document.querySelectorAll('.side-item[data-t]').forEach(function(el){el.onclick=function(){document.querySelectorAll('.side-item[data-t]').forEach(function(x){x.classList.remove('active');});el.classList.add('active');document.querySelectorAll('.panel').forEach(function(p){p.classList.remove('on');});$('t-'+el.dataset.t).classList.add('on');};});
-  if(!getAdminSecret()){showAdminLogin();}else{initAdmin();}
+  if(!getAdminToken()){showAdminLogin();}else{
+    // 토큰 유효성 검증
+    adminFetch('/admin/stats').then(function(r){
+      if(!r.ok)throw new Error('invalid');
+      return r.json();
+    }).then(function(){showChrome();initAdmin();}).catch(function(){clearAdmin();showAdminLogin();});
+  }
 });
 
 function hideChrome(){
@@ -146,31 +163,40 @@ function showAdminLogin(){
   $('t-dash').classList.add('on');
   $('t-dash').innerHTML='<div style="max-width:400px;width:100%;text-align:center;padding:40px 20px">'+
     '<div style="font-size:48px;margin-bottom:16px">🔐</div>'+
-    '<h2 style="font-size:20px;font-weight:700;margin-bottom:8px">관리자 인증</h2>'+
-    '<p style="font-size:13px;color:var(--t3);margin-bottom:24px">Admin Secret을 입력하세요</p>'+
-    '<div class="field"><input class="inp" id="adminKey" type="password" placeholder="Admin Secret" style="text-align:center"></div>'+
-    '<button class="btn btn-p" style="width:100%" onclick="verifyAdmin()">인증</button>'+
+    '<h2 style="font-size:20px;font-weight:700;margin-bottom:8px">관리자 로그인</h2>'+
+    '<p style="font-size:13px;color:var(--t3);margin-bottom:24px">관리자 계정으로 로그인하세요</p>'+
+    '<div class="field"><label style="text-align:left;display:block;font-size:12px;font-weight:600;margin-bottom:4px">이메일</label><input class="inp" id="adminEmail" type="email" placeholder="admin@example.com"></div>'+
+    '<div class="field"><label style="text-align:left;display:block;font-size:12px;font-weight:600;margin-bottom:4px">비밀번호</label><input class="inp" id="adminPw" type="password" placeholder="비밀번호"></div>'+
+    '<div id="adminErr" style="color:var(--red);font-size:12px;margin-bottom:12px;display:none;padding:8px 12px;background:var(--red-bg);border-radius:var(--r)"></div>'+
+    '<button class="btn btn-p" style="width:100%" id="adminBtn" onclick="verifyAdmin()">로그인</button>'+
     '<p style="margin-top:20px;font-size:11px;color:var(--t4)">체인저스캠퍼스 × anderson.asia</p>'+
   '</div>';
-  setTimeout(function(){var k=$('adminKey');if(k)k.focus();},200);
+  var pwEl=$('adminPw');if(pwEl)pwEl.onkeydown=function(e){if(e.key==='Enter')verifyAdmin();};
+  setTimeout(function(){var k=$('adminEmail');if(k)k.focus();},200);
 }
 
 function verifyAdmin(){
-  var key=$('adminKey').value.trim();
-  if(!key){toast('시크릿 키를 입력하세요','err');return;}
-  setAdminSecret(key);
-  adminFetch('/admin/stats').then(function(r){
-    if(!r.ok)throw new Error('invalid');
-    return r.json();
-  }).then(function(){
-    toast('관리자 인증 성공');
-    showChrome();
-    initAdmin();
-  }).catch(function(){
-    setAdminSecret('');
-    toast('인증 실패. 시크릿 키를 확인하세요.','err');
-    showAdminLogin();
-  });
+  var email=$('adminEmail').value.trim();
+  var pw=$('adminPw').value;
+  var errEl=$('adminErr');var btn=$('adminBtn');
+  if(!email||!pw){errEl.textContent='이메일과 비밀번호를 입력하세요';errEl.style.display='block';return;}
+  btn.disabled=true;btn.textContent='로그인 중...';errEl.style.display='none';
+  // Supabase Auth 로그인
+  fetch(PROXY_BASE+'/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:email,password:pw})})
+    .then(function(r){return r.json().then(function(d){return{status:r.status,data:d};});})
+    .then(function(res){
+      if(res.status!==200)throw new Error(res.data.error||'로그인 실패');
+      if(!res.data.user||res.data.user.role!=='admin')throw new Error('관리자 권한이 없는 계정입니다');
+      setAdminToken(res.data.access_token);
+      setAdminUser(res.data.user);
+      toast(res.data.user.name+'님 환영합니다');
+      showChrome();
+      initAdmin();
+    }).catch(function(e){
+      errEl.textContent=e.message;errEl.style.display='block';
+      btn.disabled=false;btn.textContent='로그인';
+      clearAdmin();
+    });
 }
 
 function initAdmin(){

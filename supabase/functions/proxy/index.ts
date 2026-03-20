@@ -95,9 +95,23 @@ Deno.serve(async (req) => {
 
   // ── Admin ──
   if (path.startsWith("/admin/")) {
-    const secret = req.headers.get("X-Admin-Secret");
-    if (!secret || secret !== Deno.env.get("ADMIN_SECRET")) return json({ error: "Unauthorized" }, 403);
-    return handleAdmin(path, req, svc);
+    // 방법 1: X-Admin-Secret
+    const adminSecret = req.headers.get("X-Admin-Secret");
+    if (adminSecret && adminSecret === Deno.env.get("ADMIN_SECRET")) {
+      return handleAdmin(path, req, svc);
+    }
+    // 방법 2: Bearer 토큰 + role=admin
+    const authHeader = req.headers.get("Authorization") || "";
+    if (authHeader.startsWith("Bearer ")) {
+      const adminUser = await validateUser(authHeader);
+      if (adminUser && !(adminUser as any)._error && !(adminUser as any).rejected && adminUser.role === "admin") {
+        return handleAdmin(path, req, svc);
+      }
+      if (adminUser && adminUser.role !== "admin") {
+        return json({ error: "관리자 권한이 없습니다", code: "NOT_ADMIN" }, 403);
+      }
+    }
+    return json({ error: "관리자 인증이 필요합니다" }, 403);
   }
 
   // ── 인증 필요 ──
