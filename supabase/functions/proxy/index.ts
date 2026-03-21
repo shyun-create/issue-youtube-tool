@@ -7,21 +7,34 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const CORS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Secret",
-  "Access-Control-Max-Age": "86400",
-};
+// ── CORS: 허용된 Origin만 ──
+const ALLOWED_ORIGINS = [
+  "https://issue-youtube-tool.vercel.app",
+  "file://",
+  "http://localhost:3000", // 개발용
+];
+
+function getCorsHeaders(req: Request) {
+  const origin = req.headers.get("Origin") || "";
+  const allowed = ALLOWED_ORIGINS.some(o => origin === o || origin.startsWith(o)) ? origin : ALLOWED_ORIGINS[0];
+  return {
+    "Access-Control-Allow-Origin": allowed,
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Secret",
+    "Access-Control-Max-Age": "86400",
+  };
+}
+
+let _corsHeaders: Record<string, string> = {};
 
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
-    status, headers: { ...CORS, "Content-Type": "application/json" },
+    status, headers: { ..._corsHeaders, "Content-Type": "application/json" },
   });
 }
 
 function rawResponse(body: ReadableStream | ArrayBuffer | null, headers: Record<string, string> = {}, status = 200) {
-  return new Response(body, { status, headers: { ...CORS, ...headers } });
+  return new Response(body, { status, headers: { ..._corsHeaders, ...headers } });
 }
 
 function getServiceClient() {
@@ -35,27 +48,24 @@ function getUserClient(authHeader: string) {
 
 // ── Auth 검증 + 승인 상태 확인 ──
 async function validateUser(authHeader: string) {
-  console.log("[Auth] validating, header present:", !!authHeader, "starts with Bearer:", authHeader?.startsWith("Bearer "));
   if (!authHeader || !authHeader.startsWith("Bearer ")) return { _error: "no_bearer" };
   
   try {
     const userClient = getUserClient(authHeader);
     const { data: { user }, error } = await userClient.auth.getUser();
-    console.log("[Auth] getUser result:", user?.id || "null", "error:", error?.message || "none");
-    if (error || !user) return { _error: "getUser_failed", _detail: error?.message || "user is null" };
+    if (error || !user) return { _error: "getUser_failed" };
 
     const svc = getServiceClient();
     const { data: profile, error: profErr } = await svc.from("profiles")
       .select("id, email, full_name, name, cohort, role, approval_status")
       .eq("id", user.id).single();
-    console.log("[Auth] profile:", profile?.email || "null", "status:", profile?.approval_status || "null", "error:", profErr?.message || "none");
 
-    if (!profile) return { _error: "no_profile", _detail: profErr?.message || "profile not found" };
+    if (!profile) return { _error: "no_profile" };
     if (profile.approval_status !== "승인완료") return { ...profile, rejected: true };
     return profile;
   } catch (err) {
-    console.error("[Auth] validateUser error:", (err as Error).message);
-    return { _error: "exception", _detail: (err as Error).message };
+    console.error("[Auth] error:", (err as Error).message);
+    return { _error: "exception" };
   }
 }
 
@@ -81,7 +91,8 @@ async function logUsage(svc: any, userId: string, endpoint: string, status = 200
 // Main Handler
 // ══════════════════════════════════════════════
 Deno.serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+  _corsHeaders = getCorsHeaders(req);
+  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: _corsHeaders });
 
   const url = new URL(req.url);
   const path = url.pathname.replace(/^\/proxy/, "");
@@ -90,7 +101,16 @@ Deno.serve(async (req) => {
   if (path === "/" || path === "/health" || path === "") return json({ status: "ok", version: "3.0.0-auth" });
 
   // ── 공개 엔드포인트: 회원가입 / 로그인 ──
-  if (path === "/auth/signup" && req.method === "POST") return handleSignup(req, svc);
+  if (path === "/auth/signup" && req.method === "POST") {
+    // IP 기반 간단한 rate limit (1분에 5회)
+    const ip = req.headers.get("x-forwarded-for") || req.headers.get("cf-connecting-ip") || "unknown";
+    const since = new Date(Date.now() - 60000).toISOString();
+    const { count } = await svc.from("usage_logs").select("*", { count: "exact", head: true })
+      .eq("endpoint", "signup").eq("user_id", ip).gte("created_at", since);
+    if ((count || 0) >= 5) return json({ error: "가입 요청이 너무 많습니다. 잠시 후 다시 시도하세요." }, 429);
+    await svc.from("usage_logs").insert({ user_id: ip, endpoint: "signup", status_code: 200, response_ms: 0 });
+    return handleSignup(req, svc);
+  }
   if (path === "/auth/login" && req.method === "POST") return handleLogin(req, svc);
 
   // ── Admin ──
@@ -116,15 +136,14 @@ Deno.serve(async (req) => {
 
   // ── 인증 필요 ──
   const authHeader = req.headers.get("Authorization") || "";
-  console.log("[Request] path:", path, "method:", req.method, "auth:", authHeader ? authHeader.substring(0, 20) + "..." : "NONE");
   
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return json({ error: "로그인이 필요합니다", code: "AUTH_REQUIRED", detail: "No Bearer token" }, 401);
+    return json({ error: "로그인이 필요합니다", code: "AUTH_REQUIRED" }, 401);
   }
   
   const user = await validateUser(authHeader);
   if (!user || (user as any)._error) {
-    return json({ error: "로그인이 필요합니다", code: "AUTH_REQUIRED", debug: user }, 401);
+    return json({ error: "로그인이 필요합니다", code: "AUTH_REQUIRED" }, 401);
   }
   if ((user as any).rejected) return json({ error: "관리자 승인 대기 중입니다", code: "APPROVAL_PENDING" }, 403);
 
@@ -197,12 +216,16 @@ async function handleAdmin(path: string, req: Request, svc: any) {
   }
   if (path === "/admin/approve" && req.method === "POST") {
     const body = await req.json();
+    if (!body.user_id || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.user_id)) return json({ error: "유효하지 않은 사용자 ID" }, 400);
     const { data } = await svc.from("profiles").update({ approval_status: "승인완료" }).eq("id", body.user_id).select().single();
+    if (!data) return json({ error: "사용자를 찾을 수 없습니다" }, 404);
     return json({ message: "승인 완료", user: data });
   }
   if (path === "/admin/reject" && req.method === "POST") {
     const body = await req.json();
+    if (!body.user_id || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.user_id)) return json({ error: "유효하지 않은 사용자 ID" }, 400);
     const { data } = await svc.from("profiles").update({ approval_status: "대기중" }).eq("id", body.user_id).select().single();
+    if (!data) return json({ error: "사용자를 찾을 수 없습니다" }, 404);
     return json({ message: "승인 취소", user: data });
   }
   if (path === "/admin/stats") {
@@ -222,7 +245,8 @@ async function handleAdmin(path: string, req: Request, svc: any) {
     const { data: logs } = await svc.from("usage_logs")
       .select("endpoint, status_code, response_ms, created_at, user_id")
       .gte("created_at", since)
-      .order("created_at", { ascending: false });
+      .order("created_at", { ascending: false })
+      .limit(10000);
 
     if (!logs) return json({ endpoints: {}, topUsers: [], daily: [], totalCalls: 0, estimatedCost: 0 });
 
@@ -326,21 +350,24 @@ async function handleLLM(req: Request, svc: any, userId: string) {
   if (prompt.length > 30000) return json({ error: "Too long" }, 400);
 
   const provider = (body.provider || "claude").toLowerCase();
-  console.log("[LLM] provider:", provider, "claude_key_exists:", !!Deno.env.get("CLAUDE_API_KEY"), "gemini_key_exists:", !!Deno.env.get("GEMINI_API_KEY"));
+  const ALLOWED_CLAUDE_MODELS = ["claude-sonnet-4-20250514", "claude-haiku-4-5-20251001"];
+  const ALLOWED_GEMINI_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash"];
 
   let resp: Response;
   if (provider === "claude") {
     const apiKey = Deno.env.get("CLAUDE_API_KEY");
     if (!apiKey) return json({ error: "Claude API 키가 서버에 설정되지 않았습니다", code: "MISSING_KEY" }, 502);
+    const model = ALLOWED_CLAUDE_MODELS.includes(body.model) ? body.model : ALLOWED_CLAUDE_MODELS[0];
     resp = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model: body.model || "claude-sonnet-4-20250514", max_tokens: Math.min(body.max_tokens || 4096, 8192), messages: [{ role: "user", content: prompt }] }),
+      body: JSON.stringify({ model, max_tokens: Math.min(body.max_tokens || 4096, 8192), messages: [{ role: "user", content: prompt }] }),
     });
   } else {
     const apiKey = Deno.env.get("GEMINI_API_KEY");
     if (!apiKey) return json({ error: "Gemini API 키가 서버에 설정되지 않았습니다", code: "MISSING_KEY" }, 502);
-    resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${body.model || "gemini-2.0-flash"}:generateContent?key=${apiKey}`, {
+    const model = ALLOWED_GEMINI_MODELS.includes(body.model) ? body.model : ALLOWED_GEMINI_MODELS[0];
+    resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
     });
@@ -349,8 +376,8 @@ async function handleLLM(req: Request, svc: any, userId: string) {
   await logUsage(svc, userId, "llm", resp.status, Date.now() - start);
   // upstream API 에러는 502로 래핑 (401/403이 우리 인증과 충돌 방지)
   if (!resp.ok) {
-    console.error("[LLM] upstream error:", resp.status, JSON.stringify(data));
-    return json({ error: "AI API 오류", code: "UPSTREAM_ERROR", upstream_status: resp.status, detail: data }, 502);
+    console.error("[LLM] upstream error:", resp.status);
+    return json({ error: "AI API 오류", code: "UPSTREAM_ERROR", upstream_status: resp.status }, 502);
   }
   return json(data);
 }
@@ -362,9 +389,16 @@ async function handleTTS(req: Request, svc: any, userId: string) {
   if (!rate.allowed) return json({ error: "요청 한도 초과" }, 429);
   const start = Date.now();
   const body = await req.json();
-  if (body.input?.text?.length > 5000) return json({ error: "Too long" }, 400);
+  if (!body.input?.text) return json({ error: "텍스트가 필요합니다" }, 400);
+  if (body.input.text.length > 5000) return json({ error: "Too long" }, 400);
+  // 허용 필드만 추출
+  const sanitizedBody = {
+    input: { text: body.input.text },
+    voice: { languageCode: body.voice?.languageCode || "ko-KR", name: body.voice?.name, ssmlGender: body.voice?.ssmlGender },
+    audioConfig: { audioEncoding: body.audioConfig?.audioEncoding || "MP3", speakingRate: Math.min(Math.max(body.audioConfig?.speakingRate || 1.0, 0.5), 2.0), pitch: Math.min(Math.max(body.audioConfig?.pitch || 0, -10), 10) }
+  };
   const resp = await fetch(`https://texttospeech.googleapis.com/v1/text:synthesize?key=${Deno.env.get("GOOGLE_TTS_KEY")}`,
-    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(sanitizedBody) });
   const data = await resp.json();
   await logUsage(svc, userId, "tts", resp.status, Date.now() - start);
   if (!resp.ok) return json({ error: "TTS API 오류", code: "UPSTREAM_ERROR", upstream_status: resp.status, detail: data }, 502);
@@ -378,7 +412,9 @@ async function handleElevenLabs(path: string, req: Request, svc: any, userId: st
   const start = Date.now();
   const sub = path.replace("/api/elevenlabs/", "");
   if (sub.startsWith("tts/")) {
-    const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${sub.replace("tts/", "")}`, {
+    const voiceId = sub.replace("tts/", "");
+    if (!/^[a-zA-Z0-9_-]+$/.test(voiceId)) return json({ error: "Invalid voice ID" }, 400);
+    const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
       method: "POST", headers: { "Content-Type": "application/json", "xi-api-key": Deno.env.get("ELEVENLABS_KEY")! }, body: req.body });
     await logUsage(svc, userId, "elevenlabs", resp.status, Date.now() - start);
     return rawResponse(resp.body, { "Content-Type": resp.headers.get("Content-Type") || "audio/mpeg" }, resp.status);
