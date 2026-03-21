@@ -428,18 +428,67 @@ function renderUsage(d){
     html+='</tbody></table></div></div>';
   }
 
-  // Rate Limit 현황
-  html+='<div class="card"><div class="card-title">Rate Limit 설정 현황</div><div class="tbl-w"><table><thead><tr><th>API</th><th style="text-align:right">제한</th><th>기간</th></tr></thead><tbody>';
-  var limits={youtube:{limit:100,window:'시간'},llm:{limit:60,window:'시간'},tts:{limit:30,window:'시간'},elevenlabs:{limit:20,window:'시간'},gas:{limit:60,window:'시간'}};
-  Object.entries(limits).forEach(function(entry){
-    html+='<tr><td>'+(epNames[entry[0]]||entry[0])+'</td><td style="text-align:right;font-family:var(--mono)">'+entry[1].limit+'회</td><td>1'+entry[1].window+'당</td></tr>';
-  });
-  html+='</tbody></table></div></div>';
+  // Rate Limit 현황 (DB에서 로드)
+  html+='<div class="card"><div class="card-title">Rate Limit 설정 현황</div><div id="rateLimitTable"><div style="padding:12px;color:var(--t3);font-size:12px">로딩 중...</div></div></div>';
 
   $('usageContent').innerHTML=html;
+
+  // DB에서 최신 Rate Limit 설정 로드
+  adminFetch('/admin/rate-config').then(function(r){return r.json();}).then(function(configs){
+    var thtml='<div class="tbl-w"><table><thead><tr><th>API</th><th style="text-align:right">제한</th><th>기간</th><th style="text-align:right">변경</th></tr></thead><tbody>';
+    configs.forEach(function(c){
+      var windowLabel=c.window_seconds>=3600?(c.window_seconds/3600)+'시간':(c.window_seconds/60)+'분';
+      thtml+='<tr><td>'+(epNames[c.endpoint]||c.endpoint)+'</td><td style="text-align:right;font-family:var(--mono)">'+c.max_requests+'회</td><td>1인/'+windowLabel+'당</td><td style="text-align:right"><button class="btn btn-o btn-sm" onclick="goTab(\'set\')">설정 →</button></td></tr>';
+    });
+    thtml+='</tbody></table></div>';
+    var el=document.getElementById('rateLimitTable');if(el)el.innerHTML=thtml;
+  }).catch(function(){
+    var el=document.getElementById('rateLimitTable');if(el)el.innerHTML='<div style="font-size:12px;color:var(--t3)">설정 로드 실패</div>';
+  });
 }
 
-function rSt(){$('t-set').innerHTML='<div class="page-head"><div><div class="page-title">설정</div><div class="page-desc">API 키는 서버(Supabase)에서 안전하게 관리됩니다</div></div></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:20px"><div class="card"><div class="card-title">YouTube Data API</div><div style="padding:16px;background:var(--bg1);border-radius:var(--r);display:flex;align-items:center;gap:8px"><span style="width:8px;height:8px;border-radius:50%;background:var(--grn);display:inline-block"></span><span style="font-size:13px;color:var(--t2)">서버에서 관리됨</span></div></div><div class="card"><div class="card-title">LLM API (Claude / Gemini)</div><div style="padding:16px;background:var(--bg1);border-radius:var(--r);display:flex;align-items:center;gap:8px"><span style="width:8px;height:8px;border-radius:50%;background:var(--grn);display:inline-block"></span><span style="font-size:13px;color:var(--t2)">서버에서 관리됨</span></div></div><div class="card"><div class="card-title">Perplexity (팩트체크)</div><div style="padding:16px;background:var(--bg1);border-radius:var(--r);display:flex;align-items:center;gap:8px"><span style="width:8px;height:8px;border-radius:50%;background:var(--grn);display:inline-block"></span><span style="font-size:13px;color:var(--t2)">서버에서 관리됨</span></div></div><div class="card"><div class="card-title">ElevenLabs (TTS)</div><div style="padding:16px;background:var(--bg1);border-radius:var(--r);display:flex;align-items:center;gap:8px"><span style="width:8px;height:8px;border-radius:50%;background:var(--grn);display:inline-block"></span><span style="font-size:13px;color:var(--t2)">서버에서 관리됨</span></div></div></div><div class="card" style="margin-top:16px;max-width:600px"><div class="card-title">GAS 백엔드</div><div style="padding:16px;background:var(--bg1);border-radius:var(--r);display:flex;align-items:center;gap:8px"><span style="width:8px;height:8px;border-radius:50%;background:var(--grn);display:inline-block"></span><span style="font-size:13px;color:var(--t2)">서버에서 관리됨</span></div></div><div class="card" style="margin-top:16px"><div class="card-title" style="color:var(--t3)">안내</div><div style="font-size:12px;color:var(--t3);line-height:1.7">모든 API 키(YouTube, Claude, Gemini, ElevenLabs, GAS)는 Supabase 서버 환경변수로 관리됩니다.<br>키 변경이 필요하면 Supabase Dashboard → Edge Functions → Secrets에서 수정하세요.<br>수강생 앱에는 API 키가 포함되지 않습니다.</div></div><div style="margin-top:20px"><button class="btn btn-o" onclick="resetAll()">전체 로컬 데이터 초기화</button></div>';}
+function rSt(){
+  $('t-set').innerHTML='<div class="page-head"><div><div class="page-title">설정</div><div class="page-desc">API Rate Limit 및 서버 설정을 관리합니다</div></div></div><div id="rateLimitSection"><div style="padding:20px;text-align:center;color:var(--t3)">설정을 불러오는 중...</div></div><div class="card" style="margin-top:20px"><div class="card-title">API 키 관리</div><div style="font-size:12px;color:var(--t3);line-height:1.7">모든 API 키(YouTube, Claude, Gemini, ElevenLabs, GAS)는 Supabase 서버 환경변수로 관리됩니다.<br>키 변경이 필요하면 Supabase Dashboard → Edge Functions → Secrets에서 수정하세요.<br>수강생 앱에는 API 키가 포함되지 않습니다.</div></div><div style="margin-top:20px"><button class="btn btn-o" onclick="resetAll()">전체 로컬 데이터 초기화</button></div>';
+  loadRateConfig();
+}
+var _rateConfigs=[];
+var _epLabels={youtube:'YouTube Data API',llm:'Claude / Gemini (AI)',tts:'Google TTS',elevenlabs:'ElevenLabs (프리미엄 TTS)',gas:'GAS (이슈링크)',trends:'Google Trends'};
+function loadRateConfig(){
+  adminFetch('/admin/rate-config').then(function(r){return r.json();}).then(function(configs){
+    _rateConfigs=configs;
+    var html='<div class="card"><div class="card-title">API Rate Limit 설정</div><div style="font-size:12px;color:var(--t3);margin-bottom:16px">1인당 시간당 최대 호출 횟수를 설정합니다. 변경 시 즉시 반영됩니다.</div>';
+    html+='<div style="display:grid;gap:16px">';
+    configs.forEach(function(c){
+      var label=_epLabels[c.endpoint]||c.endpoint;
+      var windowMin=Math.round(c.window_seconds/60);
+      html+='<div style="padding:16px;background:var(--bg1);border-radius:var(--r);border:1px solid var(--bdr)" id="rc-'+c.endpoint+'">';
+      html+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><div style="font-size:14px;font-weight:600;color:var(--t1)">'+label+'</div><span style="font-size:11px;color:var(--t3)">'+c.endpoint+'</span></div>';
+      html+='<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">';
+      html+='<div style="flex:1;min-width:160px"><label style="font-size:11px;color:var(--t3);display:block;margin-bottom:4px">최대 요청 수</label><div style="display:flex;align-items:center;gap:8px"><input type="range" min="1" max="200" value="'+c.max_requests+'" oninput="this.nextElementSibling.textContent=this.value+\'회\'" style="flex:1" data-ep="'+c.endpoint+'" data-field="max_requests"><span style="font-family:var(--mono);font-size:13px;font-weight:600;min-width:40px">'+c.max_requests+'회</span></div></div>';
+      html+='<div style="min-width:120px"><label style="font-size:11px;color:var(--t3);display:block;margin-bottom:4px">시간 윈도우</label><select class="inp" style="font-size:12px;padding:6px 8px" data-ep="'+c.endpoint+'" data-field="window_seconds"><option value="1800"'+(c.window_seconds===1800?' selected':'')+'>30분</option><option value="3600"'+(c.window_seconds===3600?' selected':'')+'>1시간</option><option value="7200"'+(c.window_seconds===7200?' selected':'')+'>2시간</option><option value="86400"'+(c.window_seconds===86400?' selected':'')+'>24시간</option></select></div>';
+      html+='<button class="btn btn-p btn-sm" onclick="saveRateConfig(\''+c.endpoint+'\')">저장</button>';
+      html+='</div></div>';
+    });
+    html+='</div></div>';
+    $('rateLimitSection').innerHTML=html;
+  }).catch(function(e){
+    $('rateLimitSection').innerHTML='<div class="card" style="border-color:var(--red)"><div style="color:var(--red);font-size:14px;font-weight:600">Rate Limit 설정 로드 실패</div><div style="font-size:12px;color:var(--t3);margin-top:4px">'+e.message+'</div><button class="btn btn-o" style="margin-top:8px" onclick="loadRateConfig()">다시 시도</button></div>';
+  });
+}
+function saveRateConfig(ep){
+  var section=document.getElementById('rc-'+ep);if(!section)return;
+  var rangeEl=section.querySelector('input[data-field="max_requests"]');
+  var windowEl=section.querySelector('select[data-field="window_seconds"]');
+  var maxReq=parseInt(rangeEl.value);
+  var windowSec=parseInt(windowEl.value);
+  var btn=section.querySelector('.btn-p');btn.disabled=true;btn.textContent='저장 중...';
+  adminFetch('/admin/rate-config',{method:'POST',body:JSON.stringify({endpoint:ep,max_requests:maxReq,window_seconds:windowSec})})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.error){toast(d.error,'err');}else{toast((_epLabels[ep]||ep)+' Rate Limit 저장 완료');}
+      btn.disabled=false;btn.textContent='저장';
+    }).catch(function(e){toast('저장 실패: '+e.message,'err');btn.disabled=false;btn.textContent='저장';});
+}
 function svSet(){toast('API 키는 서버에서 관리됩니다. Supabase Dashboard에서 변경하세요.');}
 function resetAll(){if(!confirm('모든 데이터를 초기화하시겠습니까?'))return;Object.keys(localStorage).forEach(function(k){if(k.startsWith(SK))localStorage.removeItem(k);});location.reload();}
 

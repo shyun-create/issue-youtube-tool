@@ -13,27 +13,19 @@ function clearSession() { localStorage.removeItem('yt_session'); }
 function getToken() { var s = getSession(); return s ? s.access_token : ''; }
 function getUser() { var s = getSession(); return s ? s.user : null; }
 
-// ── YouTube 개별 키 관리 (수강생 각자 발급) ──
-function getYtKey() { return localStorage.getItem('yt_api_key') || ''; }
-function setYtKey(k) { localStorage.setItem('yt_api_key', k); }
-function hasYtKey() { return !!getYtKey(); }
+// ── YouTube API: 서버에서 키 관리 (수강생 설정 불필요) ──
+function hasYtKey() { return true; } // 서버 키 사용 중
 
 function ytFetch(endpoint, params) {
-  var key = getYtKey();
-  if (!key) return Promise.reject(new Error('YouTube API 키를 등록해주세요'));
+  // 서버 프록시 경유 — 수강생 API 키 불필요
   params = params || {};
-  params.key = key;
+  delete params.key; // 서버에서 키를 붙임
   var qs = Object.keys(params).map(function(k) { return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]); }).join('&');
-  return fetch('https://www.googleapis.com/youtube/v3/' + endpoint + '?' + qs).then(function(r) {
-    if (r.status === 403 || r.status === 400) {
-      return r.json().then(function(d) {
-        var msg = d.error && d.error.message || 'YouTube API 오류';
-        if (msg.indexOf('quota') !== -1 || msg.indexOf('Quota') !== -1) throw new Error('YouTube API 일일 할당량이 초과되었습니다. 내일 다시 시도하세요.');
-        if (msg.indexOf('API key') !== -1) throw new Error('YouTube API 키가 유효하지 않습니다. 설정에서 확인해주세요.');
-        throw new Error(msg);
-      });
-    }
-    if (!r.ok) throw new Error('YouTube: HTTP ' + r.status);
+  return proxyFetch('/api/youtube/' + endpoint + '?' + qs).then(function(r) {
+    if (r.status === 429) throw new Error('YouTube 검색 한도 초과. 잠시 후 다시 시도해주세요.');
+    if (!r.ok) return r.json().then(function(d) {
+      throw new Error(d.error || 'YouTube API 오류');
+    });
     return r.json();
   });
 }
@@ -168,16 +160,21 @@ function uploadToElevenLabs(file) {
 }
 
 // ══════════════════════════════════════════════
-// Api 패치 — DOMContentLoaded 후 실행
+// Api 패치 — 전역 함수로 노출 (app.js에서 동기 호출 가능)
 // ══════════════════════════════════════════════
-(function() {
-  function patchApi() {
-    if (typeof Api === 'undefined') return;
+function patchApi() {
+    if (typeof Api === 'undefined' || Api.__proxyPatched) return;
 
     Api.getIssueLink = function() {
       return proxyFetch('/api/gas?action=issuelink&cat=all').then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
         .then(function(d) { return { hotKeywords: d.hotKeywords || [], posts: d.posts || [] }; })
         .catch(function(e) { if (e.message === 'AUTH_REQUIRED' || e.message === 'RATE_LIMIT') return { hotKeywords: [], posts: [] }; return { hotKeywords: [], posts: [] }; });
+    };
+
+    Api.getTrends = function() {
+      return proxyFetch('/api/trends').then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(function(d) { return d.keywords || []; })
+        .catch(function(e) { return []; });
     };
 
     Api.getSubtitle = function(videoId) {
@@ -188,40 +185,57 @@ function uploadToElevenLabs(file) {
     };
 
     Api.getVids = function(kwLabels, days) {
-      if (!hasYtKey()) {
-        toast('YouTube API 키를 등록해주세요. 좌측 하단 설정에서 등록할 수 있습니다.', 'err');
+      if (!hasKey()) {
+        toast('로그인이 필요합니다', 'err');
         return wait(600).then(function() { return M.videos.slice().sort(function(a, b) { return b.score - a.score; }); });
       }
       var d = new Date(); d.setDate(d.getDate() - (days || 7)); var since = d.toISOString();
-      var perKw = Math.max(3, Math.floor(15 / kwLabels.length));
-      var searches = kwLabels.map(function(q) {
-        return ytFetch('search', { part: 'snippet', q: q, type: 'video', order: 'viewCount', publishedAfter: since, maxResults: perKw, regionCode: 'KR', relevanceLanguage: 'ko' })
-          .then(function(data) { return data.items || []; });
-      });
-      return Promise.all(searches).then(function(results) {
-        var allItems = []; var seen = {};
-        results.forEach(function(items) { items.forEach(function(i) { var vid = i.id.videoId; if (vid && !seen[vid]) { seen[vid] = true; allItems.push(i); } }); });
-        var ids = allItems.map(function(i) { return i.id.videoId; }).filter(Boolean);
-        if (!ids.length) return [];
-        return ytFetch('videos', { part: 'snippet,statistics', id: ids.join(',') })
-          .then(function(vd) {
-            var chIds = vd.items.map(function(i) { return i.snippet.channelId; }).filter(function(v, i, a) { return a.indexOf(v) === i; });
-            return ytFetch('channels', { part: 'statistics', id: chIds.join(',') })
-              .then(function(cd) {
-                var cm = {}; cd.items.forEach(function(ch) { cm[ch.id] = parseInt(ch.statistics.subscriberCount || 0); });
-                return scoreVids(vd.items.map(function(it) { return { id: it.id, title: it.snippet.title, ch: it.snippet.channelTitle, thumb: (it.snippet.thumbnails.high || it.snippet.thumbnails.default).url, date: it.snippet.publishedAt.substring(0, 10), views: parseInt(it.statistics.viewCount || 0), likes: parseInt(it.statistics.likeCount || 0), subs: cm[it.snippet.channelId] || 0, desc: it.snippet.description || '', score: 0, news: false }; }));
-              });
-          });
-      }).catch(function(e) { toast(e.message, 'err'); return M.videos.slice().sort(function(a, b) { return b.score - a.score; }); });
+      // 키워드를 | 로 합쳐서 OR 검색 → search.list 1회만 호출 (100 units)
+      var mergedQ = kwLabels.join('|');
+      return ytFetch('search', { part: 'snippet', q: mergedQ, type: 'video', order: 'viewCount', publishedAfter: since, maxResults: 15, regionCode: 'KR', relevanceLanguage: 'ko' })
+        .then(function(data) { return data.items || []; })
+        .then(function(allItems) {
+          var seen = {};
+          allItems = allItems.filter(function(i) { var vid = i.id.videoId; if (vid && !seen[vid]) { seen[vid] = true; return true; } return false; });
+          var ids = allItems.map(function(i) { return i.id.videoId; }).filter(Boolean);
+          if (!ids.length) return [];
+          return ytFetch('videos', { part: 'snippet,statistics', id: ids.join(',') })
+            .then(function(vd) {
+              var chIds = vd.items.map(function(i) { return i.snippet.channelId; }).filter(function(v, i, a) { return a.indexOf(v) === i; });
+              return ytFetch('channels', { part: 'statistics', id: chIds.join(',') })
+                .then(function(cd) {
+                  var cm = {}; cd.items.forEach(function(ch) { cm[ch.id] = parseInt(ch.statistics.subscriberCount || 0); });
+                  return scoreVids(vd.items.map(function(it) { return { id: it.id, title: it.snippet.title, ch: it.snippet.channelTitle, thumb: (it.snippet.thumbnails.high || it.snippet.thumbnails.default).url, date: it.snippet.publishedAt.substring(0, 10), views: parseInt(it.statistics.viewCount || 0), likes: parseInt(it.statistics.likeCount || 0), subs: cm[it.snippet.channelId] || 0, desc: it.snippet.description || '', score: 0, news: false }; }));
+                });
+            });
+        }).catch(function(e) { toast(e.message, 'err'); return M.videos.slice().sort(function(a, b) { return b.score - a.score; }); });
+    };
+
+    // Google TTS 음성 매핑 (기본, 무료)
+    var GOOGLE_VOICE_MAP = {
+      'vc1': { name: 'ko-KR-Neural2-C', gender: 'MALE' }, 'vc2': { name: 'ko-KR-Neural2-A', gender: 'FEMALE' },
+      'vc3': { name: 'ko-KR-Neural2-C', gender: 'MALE' }, 'vc4': { name: 'ko-KR-Neural2-B', gender: 'FEMALE' },
+      'vc5': { name: 'ko-KR-Wavenet-A', gender: 'FEMALE' }, 'vc6': { name: 'ko-KR-Wavenet-C', gender: 'MALE' },
+      'vc7': { name: 'ko-KR-Wavenet-B', gender: 'FEMALE' }, 'vc8': { name: 'ko-KR-Wavenet-D', gender: 'FEMALE' },
+      'vc9': { name: 'ko-KR-Wavenet-C', gender: 'MALE' }
     };
 
     Api.genVoice = function(text, voiceId) {
       var script = text || S.es || S.scr && S.scr.content || '';
       if (!script) return Promise.reject(new Error('대본이 없습니다'));
+      // 커스텀 음성 (ElevenLabs)
       if (voiceId === 'custom' && S.elVoiceId) return genElevenLabs(script, S.elVoiceId);
+      // ElevenLabs 프리미엄 음성
+      var elVoice = M.voices.find(function(v) { return v.id === voiceId && v.provider === 'elevenlabs'; });
+      if (elVoice && elVoice.elId) {
+        return genElevenLabs(script, elVoice.elId).then(function(result) {
+          result.voiceName = elVoice.name;
+          return result;
+        });
+      }
+      // Google TTS 기본 음성
       if (hasKey()) {
-        var voiceMap = { 'vc1': { name: 'ko-KR-Neural2-C', gender: 'MALE' }, 'vc2': { name: 'ko-KR-Neural2-A', gender: 'FEMALE' }, 'vc3': { name: 'ko-KR-Neural2-C', gender: 'MALE' }, 'vc4': { name: 'ko-KR-Neural2-B', gender: 'FEMALE' }, 'vc5': { name: 'ko-KR-Wavenet-A', gender: 'FEMALE' }, 'vc6': { name: 'ko-KR-Wavenet-C', gender: 'MALE' }, 'vc7': { name: 'ko-KR-Wavenet-B', gender: 'FEMALE' }, 'vc8': { name: 'ko-KR-Wavenet-D', gender: 'FEMALE' }, 'vc9': { name: 'ko-KR-Wavenet-C', gender: 'MALE' } };
-        var voice = voiceMap[voiceId] || voiceMap['vc4'];
+        var voice = GOOGLE_VOICE_MAP[voiceId] || GOOGLE_VOICE_MAP['vc4'];
         return proxyFetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ input: { text: script }, voice: { languageCode: 'ko-KR', name: voice.name, ssmlGender: voice.gender }, audioConfig: { audioEncoding: 'MP3', speakingRate: 1.0, pitch: 0 } })
         }).then(function(r) { if (!r.ok) return r.json().then(function(d) { throw new Error(d.error ? d.error.message : 'TTS: HTTP ' + r.status); }); return r.json(); })
@@ -229,31 +243,50 @@ function uploadToElevenLabs(file) {
       }
       return wait(2000).then(function() { return M.voice; });
     };
-  }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function() { setTimeout(patchApi, 0); });
-  } else { setTimeout(patchApi, 0); }
-})();
+    Api.genThumb = function(title, script) {
+      if (!hasKey()) return Promise.resolve(['충격! ' + title, '이것만 알면 인생이 바뀝니다', '아무도 몰랐던 진실']);
+      var prompt = '당신은 유튜브 썸네일 카피라이터입니다.\n\n아래 영상 제목과 대본을 바탕으로, 클릭을 유발하는 유튜브 썸네일 문구를 3개 만들어주세요.\n\n[영상 제목]\n' + title + '\n\n[대본 요약]\n' + (script || '').substring(0, 500) + '\n\n[규칙]\n- 각 문구는 15자 이내 (짧을수록 좋음)\n- 호기심, 충격, 반전, 감정을 자극하는 문구\n- 숫자나 구체적 표현 포함\n- 물음표(?) 또는 느낌표(!) 적극 활용\n- "~하는 법" 같은 설명형은 피하기\n- 이슈 유튜브 썸네일 느낌으로\n\nJSON 배열로만 응답하세요.\n["문구1","문구2","문구3"]';
+      return callLLM(prompt).then(function(t) {
+        try { return JSON.parse(t.replace(/```json|```/g, '').trim()); }
+        catch(e) { return [t.substring(0, 30)]; }
+      });
+    };
+
+    Api.__proxyPatched = true;
+}
+
+// 안전망: DOMContentLoaded 후에도 한 번 더 시도
+setTimeout(function() { if (typeof patchApi === 'function') patchApi(); }, 0);
 
 // ── playVoicePreview / handleVoiceUpload 패치 ──
 (function() {
   function patchVoice() {
     window.playVoicePreview = function(btn) {
-      if (window._previewAudio && !window._previewAudio.paused) { window._previewAudio.pause(); window._previewAudio = null; btn.querySelector('span').textContent = '▶'; document.getElementById('vpTime').textContent = '미리듣기'; return; }
-      var voiceName = btn.dataset.voice;
+      if (window._previewAudio && !window._previewAudio.paused) { window._previewAudio.pause(); window._previewAudio = null; if(window._previewAnimId){clearInterval(window._previewAnimId);window._previewAnimId=null;} btn.querySelector('span').textContent = '▶'; document.getElementById('vpTime').textContent = '미리듣기'; var bars=document.getElementById('vpWave');if(bars)for(var i=0;i<bars.children.length;i++)bars.children[i].style.height='6px'; return; }
+      var voiceRef = btn.dataset.voice;
+      var provider = btn.dataset.provider || 'google';
       if (!hasKey()) { toast('로그인이 필요합니다', 'err'); return; }
       btn.querySelector('span').textContent = '⏳'; document.getElementById('vpTime').textContent = '로딩...';
-      proxyFetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ input: { text: '안녕하세요, 이 음성은 AI가 생성한 샘플입니다.' }, voice: { languageCode: 'ko-KR', name: voiceName }, audioConfig: { audioEncoding: 'MP3', speakingRate: 1.0, pitch: 0 } })
-      }).then(function(r) { return r.json(); }).then(function(d) {
-        if (!d.audioContent) { toast('TTS 실패', 'err'); btn.querySelector('span').textContent = '▶'; return; }
-        window._previewAudio = new Audio('data:audio/mp3;base64,' + d.audioContent); window._previewAudio.play();
+      var sampleText = '안녕하세요, 이 음성은 AI가 생성한 샘플입니다.';
+      var audioPromise;
+      if (provider === 'elevenlabs') {
+        audioPromise = genElevenLabs(sampleText, voiceRef).then(function(result) { return new Audio(result.url); });
+      } else {
+        audioPromise = proxyFetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ input: { text: sampleText }, voice: { languageCode: 'ko-KR', name: voiceRef }, audioConfig: { audioEncoding: 'MP3', speakingRate: 1.0, pitch: 0 } })
+        }).then(function(r) { return r.json(); }).then(function(d) {
+          if (!d.audioContent) throw new Error('TTS 실패');
+          return new Audio('data:audio/mp3;base64,' + d.audioContent);
+        });
+      }
+      audioPromise.then(function(audio) {
+        window._previewAudio = audio; audio.play();
         btn.querySelector('span').textContent = '⏸'; document.getElementById('vpTime').textContent = '재생 중';
         var bars = document.getElementById('vpWave').children;
-        var animId = setInterval(function() { for (var i = 0; i < bars.length; i++) { bars[i].style.height = (6 + Math.random() * 14) + 'px'; bars[i].style.background = window._previewAudio.paused ? 'var(--bg3)' : 'var(--acc)'; } }, 150);
-        window._previewAudio.onended = function() { clearInterval(animId); btn.querySelector('span').textContent = '▶'; document.getElementById('vpTime').textContent = '미리듣기'; };
-      }).catch(function(e) { toast('TTS 에러: ' + e.message, 'err'); btn.querySelector('span').textContent = '▶'; });
+        window._previewAnimId = setInterval(function() { if (!window._previewAudio) { clearInterval(window._previewAnimId); window._previewAnimId=null; return; } for (var i = 0; i < bars.length; i++) { bars[i].style.height = (6 + Math.random() * 14) + 'px'; bars[i].style.background = window._previewAudio.paused ? 'var(--bg3)' : 'var(--acc)'; } }, 150);
+        audio.onended = function() { clearInterval(window._previewAnimId); window._previewAnimId=null; btn.querySelector('span').textContent = '▶'; document.getElementById('vpTime').textContent = '미리듣기'; for(var i=0;i<bars.length;i++)bars[i].style.height='6px'; };
+      }).catch(function(e) { toast('음성 미리듣기 에러: ' + e.message, 'err'); btn.querySelector('span').textContent = '▶'; document.getElementById('vpTime').textContent = '미리듣기'; });
     };
 
     window.handleVoiceUpload = function(input) {
@@ -270,28 +303,28 @@ function uploadToElevenLabs(file) {
   else { setTimeout(patchVoice, 100); }
 })();
 
-// ── API Badge 패치 ──
+// ── API Badge 업데이트 (syncSb 래핑 대신 독립 리스너) ──
 (function() {
-  function patchBadges() {
-    if (typeof syncSb === 'undefined') return;
-    var origSyncSb = syncSb;
-    window.syncSb = function() {
-      origSyncSb();
-      var ab = document.getElementById('apiBadges');
-      if (ab) {
-        var user = getUser();
-        var b = '';
-        if (user) {
-          b += '<span class="bdg bg2" style="font-size:9px;padding:2px 6px">AUTH</span>';
-          b += '<span class="bdg bg2" style="font-size:9px;padding:2px 6px">YT</span>';
-          b += '<span class="bdg bg2" style="font-size:9px;padding:2px 6px">Claude</span>';
-        }
-        if (window.electronAPI && window.electronAPI.isElectron) b += '<span class="bdg ba" style="font-size:9px;padding:2px 6px">Electron</span>';
-        if (!b) b = '<span class="bdg bgy" style="font-size:9px;padding:2px 6px">MOCK</span>';
-        ab.innerHTML = b;
-      }
-    };
+  function updateBadges() {
+    var ab = document.getElementById('apiBadges');
+    if (!ab) return;
+    var user = getUser();
+    var b = '';
+    if (user) {
+      b += '<span class="bdg bg2" style="font-size:9px;padding:2px 6px">AUTH</span>';
+      b += '<span class="bdg bg2" style="font-size:9px;padding:2px 6px">YT</span>';
+      b += '<span class="bdg bg2" style="font-size:9px;padding:2px 6px">Claude</span>';
+    }
+    if (window.electronAPI && window.electronAPI.isElectron) b += '<span class="bdg ba" style="font-size:9px;padding:2px 6px">Electron</span>';
+    if (!b) b = '<span class="bdg bgy" style="font-size:9px;padding:2px 6px">MOCK</span>';
+    ab.innerHTML = b;
   }
-  if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', function() { setTimeout(patchBadges, 50); }); }
-  else { setTimeout(patchBadges, 50); }
+  function initBadges() {
+    if (typeof sOn === 'undefined') return;
+    sOn('step', updateBadges);
+    sOn('mx', updateBadges);
+    updateBadges();
+  }
+  if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', function() { setTimeout(initBadges, 50); }); }
+  else { setTimeout(initBadges, 50); }
 })();

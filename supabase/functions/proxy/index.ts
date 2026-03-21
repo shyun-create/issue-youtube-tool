@@ -21,7 +21,7 @@ function getCorsHeaders(req: Request) {
   return {
     "Access-Control-Allow-Origin": allowed,
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Secret",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Max-Age": "86400",
   };
 }
@@ -71,21 +71,51 @@ async function validateUser(authHeader: string) {
 }
 
 // ── Rate Limiting ──
-const RATE_LIMITS: Record<string, { limit: number; window: number }> = {
+// ── Rate Limiting (DB 기반, fallback: 하드코딩) ──
+const DEFAULT_LIMITS: Record<string, { limit: number; window: number }> = {
   youtube: { limit: 100, window: 3600 }, llm: { limit: 60, window: 3600 },
   tts: { limit: 30, window: 3600 }, elevenlabs: { limit: 20, window: 3600 }, gas: { limit: 60, window: 3600 },
+  trends: { limit: 30, window: 3600 },
 };
 
+async function getRateConfig(svc: any, endpoint: string) {
+  try {
+    const { data } = await svc.from("rate_config")
+      .select("max_requests, window_seconds")
+      .eq("endpoint", endpoint)
+      .single();
+    if (data) return { limit: data.max_requests, window: data.window_seconds };
+  } catch (_) { /* DB 실패 시 기본값 사용 */ }
+  return DEFAULT_LIMITS[endpoint] || { limit: 50, window: 3600 };
+}
+
 async function checkRate(svc: any, userId: string, endpoint: string) {
-  const c = RATE_LIMITS[endpoint] || { limit: 50, window: 3600 };
+  const c = await getRateConfig(svc, endpoint);
   const since = new Date(Date.now() - c.window * 1000).toISOString();
   const { count } = await svc.from("usage_logs").select("*", { count: "exact", head: true })
     .eq("user_id", userId).eq("endpoint", endpoint).gte("created_at", since);
   return { allowed: (count || 0) < c.limit, current: count || 0, max: c.limit };
 }
 
-async function logUsage(svc: any, userId: string, endpoint: string, status = 200, ms = 0) {
-  await svc.from("usage_logs").insert({ user_id: userId, endpoint, status_code: status, response_ms: ms });
+async function logUsage(svc: any, userId: string, endpoint: string, status = 200, ms = 0, errorDetail = "") {
+  await svc.from("usage_logs").insert({ 
+    user_id: userId, endpoint, status_code: status, response_ms: ms,
+    ...(errorDetail ? { error_details: errorDetail } : {})
+  });
+}
+
+// ── Slack 에러 알림 ──
+async function notifySlack(endpoint: string, status: number, errorMsg: string, userId = "") {
+  const webhookUrl = Deno.env.get("SLACK_WEBHOOK_URL");
+  if (!webhookUrl) return; // 웹훅 미설정 시 무시
+  try {
+    const text = `🚨 *이슈유튜브 에러*\n• 엔드포인트: \`${endpoint}\`\n• 상태: ${status}\n• 에러: ${errorMsg}\n• 유저: ${userId.substring(0, 8) || "unknown"}\n• 시간: ${new Date().toLocaleString("ko-KR", { timeZone: "Asia/Seoul" })}`;
+    await fetch(webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+  } catch (_) { /* Slack 알림 실패해도 서비스 영향 없음 */ }
 }
 
 // ══════════════════════════════════════════════
@@ -112,16 +142,21 @@ Deno.serve(async (req) => {
     await svc.from("usage_logs").insert({ user_id: ip, endpoint: "signup", status_code: 200, response_ms: 0 });
     return handleSignup(req, svc);
   }
-  if (path === "/auth/login" && req.method === "POST") return handleLogin(req, svc);
-
-  // ── Admin ──
-  if (path.startsWith("/admin/")) {
-    // 방법 1: X-Admin-Secret
-    const adminSecret = req.headers.get("X-Admin-Secret");
-    if (adminSecret && adminSecret === Deno.env.get("ADMIN_SECRET")) {
-      return handleAdmin(path, req, svc);
+  if (path === "/auth/login" && req.method === "POST") {
+    const ip = req.headers.get("x-forwarded-for") || req.headers.get("cf-connecting-ip") || "unknown";
+    const since = new Date(Date.now() - 300000).toISOString(); // 5분
+    const { count } = await svc.from("usage_logs").select("*", { count: "exact", head: true })
+      .eq("endpoint", "login").eq("user_id", ip).gte("created_at", since);
+    if ((count || 0) >= 10) {
+      notifySlack("login", 429, `Brute force 의심: IP ${ip}, ${count}회 시도`, ip);
+      return json({ error: "로그인 시도가 너무 많습니다. 5분 후 다시 시도하세요." }, 429);
     }
-    // 방법 2: Bearer 토큰 + role=admin
+    await svc.from("usage_logs").insert({ user_id: ip, endpoint: "login", status_code: 200, response_ms: 0 });
+    return handleLogin(req, svc);
+  }
+
+  // ── Admin (Bearer 토큰 + role=admin만 허용) ──
+  if (path.startsWith("/admin/")) {
     const authHeader = req.headers.get("Authorization") || "";
     if (authHeader.startsWith("Bearer ")) {
       const adminUser = await validateUser(authHeader);
@@ -151,13 +186,25 @@ Deno.serve(async (req) => {
   const userId = user.id;
   try {
     if (path.startsWith("/api/youtube/")) return handleYouTube(path, url, svc, userId);
+    if (path === "/api/trends") {
+      const trendRate = await checkRate(svc, userId, "trends");
+      if (!trendRate.allowed) return json({ error: "요청 한도 초과", code: "RATE_LIMIT" }, 429);
+      const trendResult = await handleTrends();
+      await logUsage(svc, userId, "trends", trendResult.status, 0);
+      return trendResult;
+    }
     if (path.startsWith("/api/llm")) return handleLLM(req, svc, userId);
     if (path.startsWith("/api/tts")) return handleTTS(req, svc, userId);
     if (path.startsWith("/api/elevenlabs/")) return handleElevenLabs(path, req, svc, userId);
     if (path.startsWith("/api/gas")) return handleGAS(url, svc, userId);
     if (path === "/api/me") return json(user);
     return json({ error: "Not found" }, 404);
-  } catch (err) { return json({ error: (err as Error).message }, 500); }
+  } catch (err) { 
+    const msg = (err as Error).message;
+    await notifySlack(path, 500, msg, userId);
+    await logUsage(svc, userId, path, 500, 0, msg);
+    return json({ error: msg }, 500); 
+  }
 });
 
 // ── Auth Handlers ──
@@ -320,6 +367,30 @@ async function handleAdmin(path: string, req: Request, svc: any) {
     });
   }
 
+  // ── Rate Limit 설정 조회/수정 ──
+  if (path === "/admin/rate-config") {
+    if (req.method === "POST") {
+      const body = await req.json();
+      if (!body.endpoint || !body.max_requests || !body.window_seconds) {
+        return json({ error: "endpoint, max_requests, window_seconds 필수" }, 400);
+      }
+      if (body.max_requests < 1 || body.max_requests > 10000) return json({ error: "max_requests는 1~10000 범위" }, 400);
+      if (body.window_seconds < 60 || body.window_seconds > 86400) return json({ error: "window_seconds는 60~86400 범위" }, 400);
+      const { data, error } = await svc.from("rate_config").upsert({
+        endpoint: body.endpoint,
+        max_requests: body.max_requests,
+        window_seconds: body.window_seconds,
+        description: body.description || "",
+        updated_at: new Date().toISOString(),
+      }, { onConflict: "endpoint" }).select().single();
+      if (error) return json({ error: error.message }, 500);
+      return json({ message: "설정 저장 완료", config: data });
+    }
+    // GET
+    const { data } = await svc.from("rate_config").select("*").order("endpoint");
+    return json(data || []);
+  }
+
   return json({ error: "Unknown admin endpoint" }, 404);
 }
 
@@ -331,12 +402,100 @@ async function handleYouTube(path: string, url: URL, svc: any, userId: string) {
   const sub = path.replace("/api/youtube/", "");
   if (!["search", "videos", "channels"].includes(sub)) return json({ error: "Unsupported" }, 400);
   const params = new URLSearchParams(url.search);
-  params.delete("key"); params.set("key", Deno.env.get("YOUTUBE_API_KEY")!);
+  params.delete("key");
+
+  // ── 캐싱: search 엔드포인트만 캐싱 (가장 비싼 호출) ──
+  if (sub === "search") {
+    const cacheKey = "search:" + (params.get("q") || "") + ":" + (params.get("publishedAfter") || "").substring(0, 10) + ":" + (params.get("maxResults") || "5");
+    try {
+      // 캐시 조회
+      const { data: cached } = await svc.from("youtube_cache")
+        .select("result")
+        .eq("cache_key", cacheKey)
+        .gt("expires_at", new Date().toISOString())
+        .single();
+      if (cached) {
+        await logUsage(svc, userId, "youtube_cache", 200, Date.now() - start);
+        return json(cached.result);
+      }
+    } catch (_) { /* 캐시 미스 — 정상 */ }
+
+    // 캐시 미스 → YouTube API 호출
+    params.set("key", Deno.env.get("YOUTUBE_API_KEY")!);
+    const resp = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`);
+    const data = await resp.json();
+    await logUsage(svc, userId, "youtube", resp.status, Date.now() - start);
+    if (!resp.ok) return json({ error: "YouTube API 오류", code: "UPSTREAM_ERROR", upstream_status: resp.status }, 502);
+
+    // 캐시 저장 (6시간 유효)
+    const expiresAt = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
+    await svc.from("youtube_cache").upsert({
+      cache_key: cacheKey,
+      endpoint: "search",
+      result: data,
+      expires_at: expiresAt,
+    }, { onConflict: "cache_key" }).then(() => {}).catch(() => {});
+
+    return json(data);
+  }
+
+  // ── videos, channels는 캐싱 없이 바로 호출 (1 unit으로 저렴) ──
+  params.set("key", Deno.env.get("YOUTUBE_API_KEY")!);
   const resp = await fetch(`https://www.googleapis.com/youtube/v3/${sub}?${params}`);
   const data = await resp.json();
   await logUsage(svc, userId, "youtube", resp.status, Date.now() - start);
-  if (!resp.ok) return json({ error: "YouTube API 오류", code: "UPSTREAM_ERROR", upstream_status: resp.status, detail: data }, 502);
+  if (!resp.ok) return json({ error: "YouTube API 오류", code: "UPSTREAM_ERROR", upstream_status: resp.status }, 502);
   return json(data);
+}
+
+// ── Google Trends (API 키 불필요) ──
+async function handleTrends() {
+  const svc = getServiceClient();
+  // 캐시 조회 (10분 유효)
+  try {
+    const { data: cached } = await svc.from("youtube_cache")
+      .select("result")
+      .eq("cache_key", "trends:kr")
+      .gt("expires_at", new Date().toISOString())
+      .single();
+    if (cached) return json(cached.result);
+  } catch (_) { /* 캐시 미스 */ }
+
+  try {
+    const resp = await fetch("https://trends.google.com/trending/rss?geo=KR");
+    if (!resp.ok) return json({ error: "Google Trends 오류", code: "UPSTREAM_ERROR" }, 502);
+    const xml = await resp.text();
+    const titles: string[] = [];
+    const regex = /<item>[\s\S]*?<title>([^<]+)<\/title>/g;
+    let match;
+    while ((match = regex.exec(xml)) !== null) {
+      const kw = match[1].trim();
+      if (kw && titles.length < 20) titles.push(kw);
+    }
+    const trafficRegex = /<ht:approx_traffic>([^<]+)<\/ht:approx_traffic>/g;
+    const traffics: string[] = [];
+    while ((match = trafficRegex.exec(xml)) !== null) {
+      traffics.push(match[1].trim());
+    }
+    const koRegex = /[가-힣]/;
+    const keywords = titles
+      .map((t, i) => ({ keyword: t, traffic: traffics[i] || '', source: 'google_trends', rank: 0 }))
+      .filter(k => koRegex.test(k.keyword))
+      .map((k, i) => ({ ...k, rank: i + 1 }));
+    const result = { keywords, source: "google_trends", geo: "KR", count: keywords.length };
+
+    // 캐시 저장 (10분)
+    await svc.from("youtube_cache").upsert({
+      cache_key: "trends:kr", endpoint: "trends", result,
+      expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+    }, { onConflict: "cache_key" }).catch(() => {});
+
+    return json(result);
+  } catch (err) {
+    console.error("[Trends] error:", (err as Error).message);
+    notifySlack("trends", 502, (err as Error).message);
+    return json({ error: "Google Trends 연결 실패" }, 502);
+  }
 }
 
 // ── LLM Proxy ──
@@ -378,6 +537,7 @@ async function handleLLM(req: Request, svc: any, userId: string) {
   // upstream API 에러는 502로 래핑 (401/403이 우리 인증과 충돌 방지)
   if (!resp.ok) {
     console.error("[LLM] upstream error:", resp.status);
+    notifySlack("llm", resp.status, `AI API ${resp.status}`, userId);
     return json({ error: "AI API 오류", code: "UPSTREAM_ERROR", upstream_status: resp.status }, 502);
   }
   return json(data);
@@ -402,7 +562,7 @@ async function handleTTS(req: Request, svc: any, userId: string) {
     { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(sanitizedBody) });
   const data = await resp.json();
   await logUsage(svc, userId, "tts", resp.status, Date.now() - start);
-  if (!resp.ok) return json({ error: "TTS API 오류", code: "UPSTREAM_ERROR", upstream_status: resp.status, detail: data }, 502);
+  if (!resp.ok) { notifySlack("tts", resp.status, `TTS API ${resp.status}`, userId); return json({ error: "TTS API 오류", code: "UPSTREAM_ERROR", upstream_status: resp.status, detail: data }, 502); }
   return json(data);
 }
 
@@ -415,17 +575,39 @@ async function handleElevenLabs(path: string, req: Request, svc: any, userId: st
   if (sub.startsWith("tts/")) {
     const voiceId = sub.replace("tts/", "");
     if (!/^[a-zA-Z0-9_-]+$/.test(voiceId)) return json({ error: "Invalid voice ID" }, 400);
+    // body 파싱 + 허용 필드만 추출 (크레딧 보호)
+    let elBody: any;
+    try { elBody = await req.json(); } catch (_) { return json({ error: "Invalid request body" }, 400); }
+    if (!elBody.text || typeof elBody.text !== "string") return json({ error: "텍스트가 필요합니다" }, 400);
+    if (elBody.text.length > 5000) return json({ error: "텍스트가 너무 깁니다 (5000자 제한)" }, 400);
+    const sanitizedEl = {
+      text: elBody.text,
+      model_id: "eleven_multilingual_v2",
+      voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+    };
     const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
-      method: "POST", headers: { "Content-Type": "application/json", "xi-api-key": Deno.env.get("ELEVENLABS_KEY")! }, body: req.body });
+      method: "POST", headers: { "Content-Type": "application/json", "xi-api-key": Deno.env.get("ELEVENLABS_KEY")! },
+      body: JSON.stringify(sanitizedEl) });
     await logUsage(svc, userId, "elevenlabs", resp.status, Date.now() - start);
+    if (!resp.ok) notifySlack("elevenlabs", resp.status, `ElevenLabs TTS ${resp.status} voice:${voiceId}`, userId);
     return rawResponse(resp.body, { "Content-Type": resp.headers.get("Content-Type") || "audio/mpeg" }, resp.status);
   }
   if (sub === "voices/add") {
+    // 파일 크기 제한 (10MB)
+    const contentLength = parseInt(req.headers.get("content-length") || "0");
+    if (contentLength > 10 * 1024 * 1024) return json({ error: "파일이 너무 큽니다 (10MB 제한)" }, 400);
     const resp = await fetch("https://api.elevenlabs.io/v1/voices/add", { method: "POST", headers: { "xi-api-key": Deno.env.get("ELEVENLABS_KEY")! }, body: req.body });
     const data = await resp.json();
     await logUsage(svc, userId, "elevenlabs", resp.status, Date.now() - start);
     if (!resp.ok) return json({ error: "ElevenLabs API 오류", code: "UPSTREAM_ERROR", detail: data }, 502);
     return json(data);
+  }
+  if (sub === "voices") {
+    const resp = await fetch("https://api.elevenlabs.io/v1/voices", { headers: { "xi-api-key": Deno.env.get("ELEVENLABS_KEY")! } });
+    const data = await resp.json();
+    if (!resp.ok) return json({ error: "ElevenLabs API 오류", code: "UPSTREAM_ERROR" }, 502);
+    const voices = (data.voices || []).map((v: any) => ({ voice_id: v.voice_id, name: v.name, category: v.category, labels: v.labels }));
+    return json({ voices, count: voices.length });
   }
   return json({ error: "Unsupported" }, 400);
 }
@@ -436,8 +618,42 @@ async function handleGAS(url: URL, svc: any, userId: string) {
   if (!rate.allowed) return json({ error: "요청 한도 초과" }, 429);
   const gasUrl = Deno.env.get("GAS_URL");
   if (!gasUrl) return json({ error: "GAS not configured" }, 500);
+  // action 화이트리스트
+  const action = url.searchParams.get("action") || "";
+  if (!["issuelink", "subtitle"].includes(action)) return json({ error: "허용되지 않은 action입니다" }, 400);
+  // 허용 파라미터만 전달
+  const allowedParams: Record<string, string[]> = { issuelink: ["action","cat"], subtitle: ["action","videoId"] };
+  const safeParams = new URLSearchParams();
+  (allowedParams[action] || []).forEach(k => { const v = url.searchParams.get(k); if (v) safeParams.set(k, v); });
+
+  // issuelink는 30분 캐시 (자주 안 바뀜)
+  if (action === "issuelink") {
+    const cacheKey = "gas:issuelink:" + (url.searchParams.get("cat") || "all");
+    try {
+      const { data: cached } = await svc.from("youtube_cache")
+        .select("result").eq("cache_key", cacheKey)
+        .gt("expires_at", new Date().toISOString()).single();
+      if (cached) { await logUsage(svc, userId, "gas_cache", 200, 0); return json(cached.result); }
+    } catch (_) { /* 캐시 미스 */ }
+
+    const start = Date.now();
+    const resp = await fetch(`${gasUrl}?${safeParams}`, { redirect: "follow" });
+    const data = await resp.json();
+    await logUsage(svc, userId, "gas", resp.status, Date.now() - start);
+    if (!resp.ok) return json({ error: "GAS API 오류", code: "UPSTREAM_ERROR", detail: data }, 502);
+
+    // 캐시 저장 (30분)
+    await svc.from("youtube_cache").upsert({
+      cache_key: cacheKey, endpoint: "gas", result: data,
+      expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+    }, { onConflict: "cache_key" }).catch(() => {});
+
+    return json(data);
+  }
+
+  // subtitle은 캐싱 안 함 (영상별로 다름)
   const start = Date.now();
-  const resp = await fetch(`${gasUrl}?${new URLSearchParams(url.search)}`, { redirect: "follow" });
+  const resp = await fetch(`${gasUrl}?${safeParams}`, { redirect: "follow" });
   const data = await resp.json();
   await logUsage(svc, userId, "gas", resp.status, Date.now() - start);
   if (!resp.ok) return json({ error: "GAS API 오류", code: "UPSTREAM_ERROR", detail: data }, 502);
