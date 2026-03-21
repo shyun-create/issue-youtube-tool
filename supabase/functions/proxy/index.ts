@@ -10,6 +10,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 // ── CORS: 허용된 Origin만 ──
 const ALLOWED_ORIGINS = [
   "https://issue-youtube-tool.vercel.app",
+  "null",  // Electron file:// 에서 Origin이 "null"로 전송됨
   "file://",
   "http://localhost:3000", // 개발용
 ];
