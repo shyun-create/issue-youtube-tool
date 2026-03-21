@@ -244,6 +244,9 @@ select.inp{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns
       <div class="side-status" id="progStatus">키워드를 선택해주세요</div>
     </div>
     <div class="side-nav" id="sideNav"></div>
+    <div style="padding:12px;border-top:1px solid var(--bg3);margin-top:auto">
+      <button onclick="showYtKeyModal()" style="width:100%;padding:8px;border:1px solid var(--bg3);border-radius:var(--r);background:var(--bg1);color:var(--t2);font-size:12px;cursor:pointer;display:flex;align-items:center;gap:6px;font-family:var(--f)"><span style="font-size:14px">⚙️</span> YouTube API 키 <span id="ytKeyStatus" style="margin-left:auto;width:6px;height:6px;border-radius:50%;background:var(--red)"></span></button>
+    </div>
   </nav>
   <main class="mn" id="main"></main>
 </div>
@@ -264,6 +267,9 @@ if(typeof getUser==='undefined'){function getUser(){return null;};}
 if(typeof proxyFetch==='undefined'){function proxyFetch(){return Promise.reject(new Error('프록시 미연결'));};}
 if(typeof authLogin==='undefined'){function authLogin(){return Promise.reject(new Error('프록시 미연결'));};}
 if(typeof authSignup==='undefined'){function authSignup(){return Promise.reject(new Error('프록시 미연결'));};}
+if(typeof getYtKey==='undefined'){function getYtKey(){return'';};}
+if(typeof setYtKey==='undefined'){function setYtKey(){};}
+if(typeof hasYtKey==='undefined'){function hasYtKey(){return false;};}
 </script>
 <script src="client-proxy.js"></script>
 <script>
@@ -475,11 +481,65 @@ function syncSb(){
   if(S.step===1){$('app').classList.add('no-sb');$('sidebar').style.display='none';}
   else{$('app').classList.remove('no-sb');$('sidebar').style.display='';}
   if(S.user)$('uName').textContent=S.user.name;
-  var ab=$('apiBadges');if(ab){var cc=cfg();var b='';if(cc.yt)b+='<span class="bdg bg2" style="font-size:9px;padding:2px 6px">YT</span>';if(cc.llm&&cc.llm.length>10)b+='<span class="bdg bg2" style="font-size:9px;padding:2px 6px">'+(cc.llmP==='claude'?'Claude':'Gemini')+'</span>';if(cc.gas)b+='<span class="bdg bg2" style="font-size:9px;padding:2px 6px">GAS</span>';if(cc.el)b+='<span class="bdg bg2" style="font-size:9px;padding:2px 6px">11Labs</span>';if(window.electronAPI&&window.electronAPI.isElectron)b+='<span class="bdg ba" style="font-size:9px;padding:2px 6px">Electron</span>';if(!b)b='<span class="bdg bgy" style="font-size:9px;padding:2px 6px">MOCK</span>';ab.innerHTML=b;}
+  // YouTube 키 상태 표시
+  var ykS=$('ytKeyStatus');if(ykS)ykS.style.background=hasYtKey()?'var(--grn)':'var(--red)';
+  var ab=$('apiBadges');if(ab){var b='';
+    b+='<span class="bdg '+(hasYtKey()?'bg2':'bgy')+'" style="font-size:9px;padding:2px 6px">YT'+(hasYtKey()?'':'⚠')+'</span>';
+    b+='<span class="bdg bg2" style="font-size:9px;padding:2px 6px">Claude</span>';
+    b+='<span class="bdg bg2" style="font-size:9px;padding:2px 6px">GAS</span>';
+    if(window.electronAPI&&window.electronAPI.isElectron)b+='<span class="bdg ba" style="font-size:9px;padding:2px 6px">Electron</span>';
+    ab.innerHTML=b;
+  }
   var pct=Math.round(Math.max(0,(S.step-2))/9*100);
   var pf=$('progFill');if(pf)pf.style.width=pct+'%';
   var pt=$('progText');if(pt)pt.textContent=Math.max(0,S.step-1)+'/9';
   var ps=$('progStatus');if(ps)ps.textContent=PROG_MSG[Math.max(0,S.step-2)]||'';
+}
+
+// ── YouTube API 키 설정 모달 ──
+function showYtKeyModal(){
+  var existing=getYtKey();
+  var masked=existing?existing.substring(0,10)+'...'+existing.substring(existing.length-4):'';
+  var html='<div style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.5);z-index:9999;display:flex;align-items:center;justify-content:center" id="ytKeyOverlay" onclick="if(event.target===this)this.remove()">';
+  html+='<div style="background:var(--bg);border:1px solid var(--bg3);border-radius:16px;padding:28px;max-width:460px;width:90%;box-shadow:0 20px 40px rgba(0,0,0,.2)">';
+  html+='<h3 style="font-size:16px;font-weight:700;margin-bottom:4px">YouTube API 키 설정</h3>';
+  html+='<p style="font-size:12px;color:var(--t3);margin-bottom:16px;line-height:1.6">YouTube Data API v3 키를 입력하세요. 각 수강생이 개별로 발급받아야 합니다.<br><a href="https://console.cloud.google.com/apis/credentials" target="_blank" style="color:var(--acc)">Google Cloud Console에서 발급받기 →</a></p>';
+  if(existing)html+='<div style="font-size:11px;color:var(--grn);margin-bottom:8px">현재 등록된 키: '+masked+'</div>';
+  html+='<input class="inp" id="ytKeyInput" placeholder="AIzaSy..." value="" style="font-family:var(--mono);font-size:13px;margin-bottom:12px">';
+  html+='<div style="display:flex;gap:8px">';
+  html+='<button class="btn bp" style="flex:1" onclick="saveYtKey()">저장</button>';
+  if(existing)html+='<button class="btn bo" onclick="testYtKey()">테스트</button>';
+  html+='<button class="btn bo" onclick="document.getElementById(\'ytKeyOverlay\').remove()">닫기</button>';
+  html+='</div>';
+  if(existing)html+='<button style="margin-top:12px;background:none;border:none;color:var(--red);font-size:11px;cursor:pointer;font-family:var(--f)" onclick="removeYtKey()">키 삭제</button>';
+  html+='</div></div>';
+  document.body.insertAdjacentHTML('beforeend',html);
+  setTimeout(function(){var inp=$('ytKeyInput');if(inp)inp.focus();},100);
+}
+
+function saveYtKey(){
+  var val=$('ytKeyInput').value.trim();
+  if(!val){toast('API 키를 입력하세요','err');return;}
+  if(!val.startsWith('AIzaSy')){toast('유효한 YouTube API 키가 아닙니다 (AIzaSy...로 시작)','err');return;}
+  setYtKey(val);
+  toast('YouTube API 키가 저장되었습니다');
+  syncSb();
+  var overlay=$('ytKeyOverlay');if(overlay)overlay.remove();
+}
+
+function testYtKey(){
+  toast('YouTube API 테스트 중...');
+  ytFetch('search',{part:'snippet',q:'test',maxResults:1}).then(function(){
+    toast('YouTube API 키가 정상 동작합니다!');
+  }).catch(function(e){toast('테스트 실패: '+e.message,'err');});
+}
+
+function removeYtKey(){
+  if(!confirm('YouTube API 키를 삭제하시겠습니까?'))return;
+  localStorage.removeItem('yt_api_key');
+  toast('YouTube API 키가 삭제되었습니다');
+  syncSb();
+  var overlay=$('ytKeyOverlay');if(overlay)overlay.remove();
 }
 function showP(){document.querySelectorAll('.pnl').forEach(function(p){p.classList.remove('on');});var p=$('p'+S.step);if(p)p.classList.add('on');if(typeof window['ls'+S.step]==='function')window['ls'+S.step]();}
 function restoreProgress(){

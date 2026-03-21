@@ -13,8 +13,35 @@ function clearSession() { localStorage.removeItem('yt_session'); }
 function getToken() { var s = getSession(); return s ? s.access_token : ''; }
 function getUser() { var s = getSession(); return s ? s.user : null; }
 
-// ── cfg() / hasKey() 호환 ──
-function cfg() { return { proxy: true, yt: true, llm: true, gas: true, llmP: 'claude' }; }
+// ── YouTube 개별 키 관리 (수강생 각자 발급) ──
+function getYtKey() { return localStorage.getItem('yt_api_key') || ''; }
+function setYtKey(k) { localStorage.setItem('yt_api_key', k); }
+function hasYtKey() { return !!getYtKey(); }
+
+function ytFetch(endpoint, params) {
+  var key = getYtKey();
+  if (!key) return Promise.reject(new Error('YouTube API 키를 등록해주세요'));
+  params = params || {};
+  params.key = key;
+  var qs = Object.keys(params).map(function(k) { return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]); }).join('&');
+  return fetch('https://www.googleapis.com/youtube/v3/' + endpoint + '?' + qs).then(function(r) {
+    if (r.status === 403 || r.status === 400) {
+      return r.json().then(function(d) {
+        var msg = d.error && d.error.message || 'YouTube API 오류';
+        if (msg.indexOf('quota') !== -1 || msg.indexOf('Quota') !== -1) throw new Error('YouTube API 일일 할당량이 초과되었습니다. 내일 다시 시도하세요.');
+        if (msg.indexOf('API key') !== -1) throw new Error('YouTube API 키가 유효하지 않습니다. 설정에서 확인해주세요.');
+        throw new Error(msg);
+      });
+    }
+    if (!r.ok) throw new Error('YouTube: HTTP ' + r.status);
+    return r.json();
+  });
+}
+function cfg() {
+  var saved = {};
+  try { saved = JSON.parse(localStorage.getItem('yt_a_set') || '{}'); } catch(e) {}
+  return { proxy: true, yt: true, llm: true, gas: true, llmP: saved.llmP || 'claude' };
+}
 function hasKey(k) { return !!getToken(); }
 
 // ── 공통 fetch wrapper ──
@@ -25,13 +52,23 @@ function proxyFetch(endpoint, options) {
   if (token) options.headers['Authorization'] = 'Bearer ' + token;
   return fetch(PROXY_BASE + endpoint, options).then(function(r) {
     if (r.status === 401) {
-      clearSession();
-      toast('세션이 만료되었습니다. 다시 로그인해주세요.', 'err');
-      if (typeof doLogout === 'function') doLogout();
-      throw new Error('AUTH_REQUIRED');
+      // auth 엔드포인트이거나 세션 관련 에러만 로그아웃 처리
+      var isAuthEndpoint = endpoint === '/api/me' || endpoint.indexOf('/auth/') === 0;
+      if (isAuthEndpoint) {
+        clearSession();
+        toast('세션이 만료되었습니다. 다시 로그인해주세요.', 'err');
+        if (typeof doLogout === 'function') doLogout();
+        throw new Error('AUTH_REQUIRED');
+      }
+      // API 키 에러 등은 로그아웃하지 않고 에러만 전달
+      return r.clone().json().then(function(d) {
+        var msg = d.error || 'API 인증 오류';
+        if (d.debug && d.debug._error) msg += ' (' + d.debug._error + ')';
+        throw new Error(msg);
+      }).catch(function(e) { if (e.message === 'AUTH_REQUIRED') throw e; throw new Error(e.message || 'HTTP 401'); });
     }
     if (r.status === 403) {
-      return r.json().then(function(d) {
+      return r.clone().json().then(function(d) {
         if (d.code === 'APPROVAL_PENDING') {
           toast('관리자 승인 대기 중입니다.', 'err');
           throw new Error('APPROVAL_PENDING');
@@ -82,17 +119,23 @@ function authSignup(email, password, name, phone, cohort) {
 // ══════════════════════════════════════════════
 function callLLM(prompt, retries) {
   retries = retries || 0;
+  var provider = (cfg().llmP || 'claude').toLowerCase();
   return proxyFetch('/api/llm', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt: prompt, provider: 'claude' })
+    body: JSON.stringify({ prompt: prompt, provider: provider })
   }).then(function(r) {
     if (!r.ok) {
       if (r.status === 429 && retries < 3) {
         toast('AI 요청 한도 초과 — ' + (5 * (retries + 1)) + '초 후 재시도...', 'err');
         return wait(5000 * (retries + 1)).then(function() { return callLLM(prompt, retries + 1); });
       }
-      return r.json().then(function(d) { throw new Error(d.error || 'LLM: HTTP ' + r.status); });
+      return r.clone().json().then(function(d) {
+        var msg = d.error || 'LLM: HTTP ' + r.status;
+        if (d.code === 'UPSTREAM_ERROR') msg = 'AI API 오류: ' + (d.detail && d.detail.error && d.detail.error.message || JSON.stringify(d.detail || ''));
+        if (d.code === 'MISSING_KEY') msg = d.error;
+        throw new Error(msg);
+      }).catch(function(e) { throw e; });
     }
     return r.json();
   }).then(function(d) {
@@ -145,12 +188,14 @@ function uploadToElevenLabs(file) {
     };
 
     Api.getVids = function(kwLabels, days) {
-      if (!hasKey()) return wait(600).then(function() { return M.videos.slice().sort(function(a, b) { return b.score - a.score; }); });
+      if (!hasYtKey()) {
+        toast('YouTube API 키를 등록해주세요. 좌측 하단 설정에서 등록할 수 있습니다.', 'err');
+        return wait(600).then(function() { return M.videos.slice().sort(function(a, b) { return b.score - a.score; }); });
+      }
       var d = new Date(); d.setDate(d.getDate() - (days || 7)); var since = d.toISOString();
       var perKw = Math.max(3, Math.floor(15 / kwLabels.length));
       var searches = kwLabels.map(function(q) {
-        return proxyFetch('/api/youtube/search?part=snippet&q=' + encodeURIComponent(q) + '&type=video&order=viewCount&publishedAfter=' + since + '&maxResults=' + perKw + '&regionCode=KR&relevanceLanguage=ko')
-          .then(function(r) { if (!r.ok) return r.json().then(function(d) { throw new Error(d.error ? d.error.message : 'HTTP ' + r.status); }); return r.json(); })
+        return ytFetch('search', { part: 'snippet', q: q, type: 'video', order: 'viewCount', publishedAfter: since, maxResults: perKw, regionCode: 'KR', relevanceLanguage: 'ko' })
           .then(function(data) { return data.items || []; });
       });
       return Promise.all(searches).then(function(results) {
@@ -158,16 +203,16 @@ function uploadToElevenLabs(file) {
         results.forEach(function(items) { items.forEach(function(i) { var vid = i.id.videoId; if (vid && !seen[vid]) { seen[vid] = true; allItems.push(i); } }); });
         var ids = allItems.map(function(i) { return i.id.videoId; }).filter(Boolean);
         if (!ids.length) return [];
-        return proxyFetch('/api/youtube/videos?part=snippet,statistics&id=' + ids.join(','))
-          .then(function(r) { return r.json(); }).then(function(vd) {
+        return ytFetch('videos', { part: 'snippet,statistics', id: ids.join(',') })
+          .then(function(vd) {
             var chIds = vd.items.map(function(i) { return i.snippet.channelId; }).filter(function(v, i, a) { return a.indexOf(v) === i; });
-            return proxyFetch('/api/youtube/channels?part=statistics&id=' + chIds.join(','))
-              .then(function(r) { return r.json(); }).then(function(cd) {
+            return ytFetch('channels', { part: 'statistics', id: chIds.join(',') })
+              .then(function(cd) {
                 var cm = {}; cd.items.forEach(function(ch) { cm[ch.id] = parseInt(ch.statistics.subscriberCount || 0); });
                 return scoreVids(vd.items.map(function(it) { return { id: it.id, title: it.snippet.title, ch: it.snippet.channelTitle, thumb: (it.snippet.thumbnails.high || it.snippet.thumbnails.default).url, date: it.snippet.publishedAt.substring(0, 10), views: parseInt(it.statistics.viewCount || 0), likes: parseInt(it.statistics.likeCount || 0), subs: cm[it.snippet.channelId] || 0, desc: it.snippet.description || '', score: 0, news: false }; }));
               });
           });
-      }).catch(function(e) { if (e.message === 'AUTH_REQUIRED') return []; return M.videos.slice().sort(function(a, b) { return b.score - a.score; }); });
+      }).catch(function(e) { toast(e.message, 'err'); return M.videos.slice().sort(function(a, b) { return b.score - a.score; }); });
     };
 
     Api.genVoice = function(text, voiceId) {
