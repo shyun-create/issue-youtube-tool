@@ -211,6 +211,90 @@ async function handleAdmin(path: string, req: Request, svc: any) {
     const approved = data?.filter((p: any) => p.approval_status === "승인완료").length || 0;
     return json({ total, approved, pending: total - approved });
   }
+
+  // ── 사용량 통계 ──
+  if (path === "/admin/usage") {
+    const url = new URL(req.url);
+    const days = parseInt(url.searchParams.get("days") || "7");
+    const since = new Date(Date.now() - days * 86400000).toISOString();
+
+    // 엔드포인트별 총 호출 수
+    const { data: logs } = await svc.from("usage_logs")
+      .select("endpoint, status_code, response_ms, created_at, user_id")
+      .gte("created_at", since)
+      .order("created_at", { ascending: false });
+
+    if (!logs) return json({ endpoints: {}, topUsers: [], daily: [], totalCalls: 0, estimatedCost: 0 });
+
+    // 엔드포인트별 집계
+    const endpoints: Record<string, { count: number; errors: number; avgMs: number }> = {};
+    const userCounts: Record<string, number> = {};
+    const dailyCounts: Record<string, Record<string, number>> = {};
+
+    for (const log of logs) {
+      const ep = log.endpoint;
+      if (!endpoints[ep]) endpoints[ep] = { count: 0, errors: 0, avgMs: 0 };
+      endpoints[ep].count++;
+      if (log.status_code >= 400) endpoints[ep].errors++;
+      endpoints[ep].avgMs += log.response_ms || 0;
+
+      // 유저별
+      userCounts[log.user_id] = (userCounts[log.user_id] || 0) + 1;
+
+      // 일별
+      const day = log.created_at.substring(0, 10);
+      if (!dailyCounts[day]) dailyCounts[day] = {};
+      dailyCounts[day][ep] = (dailyCounts[day][ep] || 0) + 1;
+    }
+
+    // 평균 응답 시간 계산
+    for (const ep of Object.keys(endpoints)) {
+      endpoints[ep].avgMs = Math.round(endpoints[ep].avgMs / endpoints[ep].count);
+    }
+
+    // 상위 유저 (ID → 이메일 매핑)
+    const topUserIds = Object.entries(userCounts)
+      .sort((a, b) => b[1] - a[1]).slice(0, 10);
+    const userIds = topUserIds.map(u => u[0]);
+    const { data: profiles } = await svc.from("profiles")
+      .select("id, email, full_name, name").in("id", userIds);
+    const profileMap: Record<string, any> = {};
+    (profiles || []).forEach((p: any) => { profileMap[p.id] = p; });
+
+    const topUsers = topUserIds.map(([id, count]) => ({
+      email: profileMap[id]?.email || id.substring(0, 8),
+      name: profileMap[id]?.full_name || profileMap[id]?.name || "",
+      count,
+    }));
+
+    // 일별 데이터 (최근 N일)
+    const daily = Object.entries(dailyCounts)
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([date, eps]) => ({ date, ...eps, total: Object.values(eps).reduce((a, b) => a + b, 0) }));
+
+    // 예상 비용 (대략적)
+    const costMap: Record<string, number> = {
+      llm: 0.015, // Claude ~$0.015/call avg
+      tts: 0.006, // Google TTS ~$0.006/call avg
+      elevenlabs: 0.03, // ElevenLabs ~$0.03/call avg
+      youtube: 0.0001, // YouTube ~$0.0001/call
+      gas: 0, // GAS free
+    };
+    let estimatedCost = 0;
+    for (const [ep, info] of Object.entries(endpoints)) {
+      estimatedCost += (costMap[ep] || 0) * info.count;
+    }
+
+    return json({
+      totalCalls: logs.length,
+      endpoints,
+      topUsers,
+      daily,
+      estimatedCost: Math.round(estimatedCost * 100) / 100,
+      period: { days, since },
+    });
+  }
+
   return json({ error: "Unknown admin endpoint" }, 404);
 }
 
